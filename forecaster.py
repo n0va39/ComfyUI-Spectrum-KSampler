@@ -17,7 +17,13 @@ def _unflatten(x_flat: torch.Tensor, shape: torch.Size) -> torch.Tensor:
 
 
 class ChebyshevForecaster:
-    """Chebyshev T-polynomial ridge regression forecaster."""
+    """Chebyshev T-polynomial ridge regression forecaster.
+
+    Regresses in log-sigma space so the fit is invariant to scheduler choice
+    (simple / karras / exponential / beta / ...). `t` inputs to update/predict
+    are log-sigma values; the class rescales them to [-1, 1] via the supplied
+    log-sigma bounds before building the Chebyshev basis.
+    """
 
     def __init__(
         self,
@@ -25,14 +31,17 @@ class ChebyshevForecaster:
         K: int = 10,
         lam: float = 1e-3,
         device: Optional[torch.device] = None,
-        total_steps: int = 30,
+        log_sigma_min: float = -10.0,
+        log_sigma_max: float = 10.0,
     ):
         assert K >= M + 2, "K should exceed basis size for stability"
+        assert log_sigma_max > log_sigma_min, "log_sigma_max must exceed log_sigma_min"
         self.M = M
         self.K = K
         self.lam = lam
         self.device = device
-        self.total_steps = total_steps
+        self.log_sigma_min = log_sigma_min
+        self.log_sigma_max = log_sigma_max
 
         self.t_buf = torch.empty(0)
         self._H_buf: Optional[torch.Tensor] = None
@@ -44,7 +53,10 @@ class ChebyshevForecaster:
         return self.M + 1
 
     def _taus(self, t: torch.Tensor) -> torch.Tensor:
-        return 2.0 * (t / self.total_steps) - 1.0
+        span = self.log_sigma_max - self.log_sigma_min
+        # Clamp to [-1, 1] so extrapolation past the scheduled range (e.g. due
+        # to denoise<1 subset or numerical drift) doesn't explode the basis.
+        return (2.0 * (t - self.log_sigma_min) / span - 1.0).clamp(-1.0, 1.0)
 
     def _build_design(self, taus: torch.Tensor) -> torch.Tensor:
         taus = taus.reshape(-1, 1)
@@ -114,7 +126,10 @@ class ChebyshevForecaster:
 
 
 class SpectrumPredictor:
-    """Chebyshev polynomial forecaster with optional first-order Taylor blending."""
+    """Chebyshev polynomial forecaster with optional first-order Taylor blending.
+
+    All `t` / `t_star` values are log-sigma. Scheduler-agnostic.
+    """
 
     def __init__(
         self,
@@ -123,10 +138,12 @@ class SpectrumPredictor:
         w: float,
         device: torch.device,
         feature_shape,
-        total_steps: int = 30,
+        log_sigma_min: float,
+        log_sigma_max: float,
     ):
         self.cheb = ChebyshevForecaster(
-            M=m, K=100, lam=lam, device=device, total_steps=total_steps
+            M=m, K=100, lam=lam, device=device,
+            log_sigma_min=log_sigma_min, log_sigma_max=log_sigma_max,
         )
         self.w = w
 
@@ -144,7 +161,14 @@ class SpectrumPredictor:
 
         H = self.cheb._H_buf
         t = self.cheb.t_buf
-        dt = (t[-1] - t[-2]).clamp_min(1e-8)
+        # log-sigma decreases with step, so dt is typically negative; preserve
+        # its sign while flooring the magnitude to avoid division by zero.
+        dt_raw = t[-1] - t[-2]
+        dt = torch.where(
+            dt_raw.abs() < 1e-8,
+            torch.full_like(dt_raw, 1e-8),
+            dt_raw,
+        )
         k = ((t_star_t - t[-1]) / dt).to(H.dtype)
         h_taylor = (H[-1] + k * (H[-1] - H[-2])).reshape(h_cheb.shape)
         return (1 - self.w) * h_taylor + self.w * h_cheb
