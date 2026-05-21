@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import comfy.sample
+import comfy.samplers
 import comfy.utils
 import latent_preview
 
@@ -107,12 +108,37 @@ class SpectrumState:
         self.curr_ws = window_size
         self.consec_cached = 0
         self.fwd_count = 0
+        self.steps_seen = 0  # cumulative forwards across SPD resets (logging)
+
+        # When False, every step runs an actual forward and no forecaster is
+        # built — used by the SPEED sampler to keep the low-res SPD prefix
+        # uncached (phase-2-only). Flipped True (with a reset) at the handoff.
+        self.active = True
 
         # Forecasters keyed by cond_or_uncond value (0=cond, 1=uncond)
         self.forecasters: Dict[int, SpectrumPredictor] = {}
         self.captured_feat: Optional[torch.Tensor] = None
 
+    def reset(self) -> None:
+        """Re-arm a fresh warmup window, discarding the current forecasters.
+
+        Called by the SPEED sampler at the SPD resolution handoff: the captured
+        ``final_layer`` feature changes token grid across the transition, so the
+        stage-0 forecasters are unusable and Spectrum must re-warm on the
+        full-res tail. ``fwd_count`` / ``steps_seen`` are left intact so the
+        end-of-sample speedup log spans both phases.
+        """
+        self.step_idx = -1
+        self.last_sigma = None
+        self.mode = "actual"
+        self.curr_ws = self.window_size
+        self.consec_cached = 0
+        self.forecasters = {}
+        self.captured_feat = None
+
     def should_cache(self) -> bool:
+        if not self.active:
+            return False
         if self.step_idx < self.warmup_steps:
             return False
         stop_at = self.num_steps - 3
@@ -166,8 +192,18 @@ def spectrum_sample(
     clip=None,
     smc_cfg_alpha: float = 0.0,
     smc_cfg_lambda: float = 5.0,
+    spd_scale: float = 1.0,
+    spd_sigma: float = 1.0,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
+
+    spd_scale / spd_sigma: SPD (SPEED) multi-resolution knobs. When
+        ``spd_scale < 1`` and ``0 < spd_sigma < 1`` the denoise loop is driven by
+        the custom SPEED sampler (see ``spd.make_speed_sampler``): the
+        ``spd_scale`` low-res prefix runs uncached, then at ``σ ≤ spd_sigma`` the
+        latent is spectral-expanded to full resolution and Spectrum forecasts the
+        tail (phase-2-only naive-reset compose; ``bench/spd/compose_report.md``).
+        Forces Euler. Defaults (1.0, 1.0) = no SPD, vanilla Spectrum path.
 
     dcw_mode: "off" / "manual" / "auto".
         - off: no DCW correction.
@@ -268,6 +304,7 @@ def spectrum_sample(
                     state.consec_cached += 1
 
             state.step_idx += 1
+            state.steps_seen += 1
             state.last_sigma = sigma_val
             state.mode = "cached" if state.should_cache() else "actual"
 
@@ -292,7 +329,7 @@ def spectrum_sample(
             result = apply_model(input_x, timestep, **c)
 
         feat = state.captured_feat
-        if feat is not None:
+        if state.active and feat is not None:
             batch_chunks = len(cond_or_uncond)
             feat_chunks = feat.chunk(batch_chunks, dim=0)
             for idx, cou in enumerate(cond_or_uncond):
@@ -332,23 +369,66 @@ def spectrum_sample(
     callback = latent_preview.prepare_callback(m, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-    try:
-        samples = comfy.sample.sample(
-            m,
-            noise,
-            steps,
-            cfg,
+    # SPD (SPEED) takes over the loop when a real low→full transition is asked
+    # for. It must own the loop (mid-loop resolution change + σ re-space), so it
+    # runs through a custom KSAMPLER via sample_custom rather than the string
+    # sampler path. Everything upstream (SMC / DCW / mod-guidance / the Spectrum
+    # wrapper + capture hook) is already installed on ``m`` and composes.
+    spd_active = spd_scale < 1.0 and 0.0 < spd_sigma < 1.0
+    if spd_active and sampler_name != "euler":
+        logger.warning(
+            "SPEED/SPD re-spaces σ mid-loop and is Euler-only; ignoring requested "
+            "sampler '%s' and using Euler.",
             sampler_name,
-            scheduler,
-            positive,
-            negative,
-            latent_img,
-            denoise=denoise,
-            noise_mask=noise_mask,
-            callback=callback,
-            disable_pbar=disable_pbar,
-            seed=seed,
         )
+
+    try:
+        if spd_active:
+            from .spd import make_speed_sampler
+
+            # Phase-2-only: the SPEED sampler flips state.active True at the handoff.
+            state.active = False
+            ks = comfy.samplers.KSampler(
+                m,
+                steps=steps,
+                device=m.load_device,
+                sampler="euler",
+                scheduler=scheduler,
+                denoise=denoise,
+                model_options=m.model_options,
+            )
+            sampler_obj = make_speed_sampler(state, spd_scale, spd_sigma, seed)
+            samples = comfy.sample.sample_custom(
+                m,
+                noise,
+                cfg,
+                sampler_obj,
+                ks.sigmas,
+                positive,
+                negative,
+                latent_img,
+                noise_mask=noise_mask,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
+        else:
+            samples = comfy.sample.sample(
+                m,
+                noise,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_img,
+                denoise=denoise,
+                noise_mask=noise_mask,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
     finally:
         dit.final_layer._spectrum_state = None
         if hasattr(dit, "_mod_pooled_proj"):
@@ -364,13 +444,18 @@ def spectrum_sample(
             state.consec_cached += 1
 
     actual = state.fwd_count
-    total = state.step_idx + 1
+    # SPD resets step_idx at the handoff, so step_idx only spans the tail; use
+    # the cumulative step counter for the across-phase total. Note the low-res
+    # prefix forwards are cheaper than full-res, so this block-skip ratio
+    # understates the true SPEED wall-clock speedup.
+    total = state.steps_seen if spd_active else state.step_idx + 1
     speedup = total / max(1, actual)
     do_cfg = not math.isclose(cfg, 1.0)
     cfg_note = " (x2 for CFG)" if do_cfg else ""
+    tag = "SPEED (SPD+Spectrum)" if spd_active else "Spectrum"
     logger.info(
-        f"Spectrum: {actual}/{total} actual forwards "
-        f"({speedup:.2f}x theoretical speedup{cfg_note})"
+        f"{tag}: {actual}/{total} actual forwards "
+        f"({speedup:.2f}x block-skip ratio{cfg_note})"
     )
 
     out = latent_image.copy()

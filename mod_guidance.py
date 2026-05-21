@@ -253,16 +253,23 @@ class ModGuidanceState:
         self.per_block_schedule: Optional[List[float]] = None  # length num_blocks
 
     def _encode_pool(self, raw, t5_ids, t5_weights, device, dtype):
+        # The DiT's llm_adapter can live on a different device than the sampling
+        # `device` — comfy keeps it CPU-resident here even when the main blocks
+        # are GPU-loaded, so feeding cuda ids to a CPU embedding throws an
+        # index_select device mismatch. Run the adapter on its own parameter
+        # device, then return the pooled result on `device` so the projection
+        # MLP (loaded on `device`) matches.
+        adapter_device = next(self.dit.llm_adapter.parameters()).device
         adapted = self.dit.preprocess_text_embeds(
-            raw.unsqueeze(0).to(device=device, dtype=dtype),
-            t5_ids.unsqueeze(0).to(device=device) if t5_ids is not None else None,
+            raw.unsqueeze(0).to(device=adapter_device, dtype=dtype),
+            t5_ids.unsqueeze(0).to(device=adapter_device) if t5_ids is not None else None,
             t5xxl_weights=(
-                t5_weights.unsqueeze(0).unsqueeze(-1).to(device=device, dtype=dtype)
+                t5_weights.unsqueeze(0).unsqueeze(-1).to(device=adapter_device, dtype=dtype)
                 if t5_weights is not None
                 else None
             ),
         )
-        return adapted.max(dim=1).values  # (1, pooled_dim)
+        return adapted.max(dim=1).values.to(device)  # (1, pooled_dim)
 
     def ensure_precomputed(self, device, dtype):
         """Run LLM adapter + projection for pos / neg / tag once, cache base

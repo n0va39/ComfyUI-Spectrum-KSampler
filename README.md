@@ -12,8 +12,9 @@ Tuned for the [Anima](https://github.com/sorryhyun/anima_lora) DiT — its modul
 - [Modulation guidance](#modulation-guidance) — AdaLN-side quality steering via `pooled_text_proj`
 - [SMC-CFG (α-adaptive sliding-mode CFG)](#smc-cfg-α-adaptive-sliding-mode-cfg) — velocity-space CFG combine modification
 - [DCW post-step bias correction](#dcw-post-step-bias-correction) — sampler-level SNR-t bias correction (Advanced node)
+- [SPEED (Spectrum + SPD multi-resolution)](#speed-spectrum--spd-multi-resolution) — low-res prefix + spectral expansion, stacked on Spectrum
 
-The three feature blocks compose cleanly — they intervene at distinct points in the sampling loop (AdaLN → CFG combine → post-step x-space).
+The feature blocks compose cleanly — they intervene at distinct points in the sampling loop (AdaLN → CFG combine → post-step x-space → and the SPEED node, which owns the loop).
 
 ## How it works
 
@@ -129,3 +130,21 @@ The bias direction is **(CFG × aspect)-dependent**. Default `+0.01` is the veri
 | `HH`, `LH+HL+HH` | Ablation modes. `HH`-only is empirically dead; `LH+HL+HH` pulled in for completeness. |
 
 The schedule is fixed to `one_minus_sigma` (correction concentrates at low σ where Anima's bias is largest). Implementation is sampler-agnostic — DCW mutates the latent at the step boundary via a `CALC_COND_BATCH` wrapper plus a post-CFG capture hook, so it composes correctly with Euler / ER-SDE / DPM++ / etc., with CFG on or off, and stacks cleanly on top of Spectrum + mod guidance. The DWT/iDWT round-trip on `LL` mode is one pass over the latent (negligible vs the DiT forward).
+
+## SPEED (Spectrum + SPD multi-resolution)
+
+The **KSampler (Spectrum + SPD / SPEED)** node stacks **SPD** (Spectral Progressive Diffusion — [Xiao et al., arXiv:2605.18736](https://arxiv.org/abs/2605.18736)) on top of Spectrum. SPD runs the early, noise-dominated steps at a **lower resolution** (cheap, far fewer tokens), then spectral-expands the latent to full resolution once finer frequencies emerge — and Spectrum forecasts the full-res tail. The two accelerations target different parts of the trajectory (SPD shrinks tokens early, Spectrum skips blocks late), so they compose rather than compete.
+
+This is the **naive-reset compose** validated in [`bench/spd/compose_report.md`](https://github.com/sorryhyun/anima_lora/blob/main/bench/spd/compose_report.md): the low-res prefix runs uncached, then at the handoff Spectrum's forecaster is reset and re-warms over the full-res tail (phase-2-only). At the validated knee it was coherent across seeds and the fastest of the tested configs (≈×1.98 wall vs Spectrum-alone ≈×1.73).
+
+| Parameter | Default | Description |
+|---|---|---|
+| `split_mode` | `single` | Resolution schedule. `single` = one low→full transition (v0). |
+| `spd_scale` | `0.5` | Prefix resolution (fraction of full latent H/W). `0.5` ≈ a quarter the tokens — the benched-coherent point. `1.0` disables SPD (= vanilla Spectrum). |
+| `spd_sigma` | `0.7` | Handoff σ: switch low→full when the schedule drops to this noise level. `0.7` is the validated knee. `1.0` disables SPD. |
+
+**Caveats.** SPD re-spaces the σ schedule mid-loop, so the SPEED sampler is **Euler-only** (any other `sampler_name` is ignored with a warning). The scale `0.5` / σ `0.7` point is the only benched-coherent config — **lower scales or later/more-aggressive knees are untested** and stress the handoff re-warm (especially on HF-detail prompts). The reported block-skip ratio in the log understates the true speedup because it counts the cheaper low-res prefix forwards as full forwards.
+
+### Modulation guidance as a standalone patcher
+
+The **Anima Mod Guidance (model patch)** node applies the same quality steering as the mod-guidance samplers, but as a standalone `MODEL → MODEL` patcher. Wire its output into *any* sampler — including the SPEED node — to compose mod guidance with SPD without a dedicated combined node. (Wire the same `positive` / `negative` conditioning into both the patcher and the sampler; the patcher reads them only to compute the steering delta.) The in-sampler mod-guidance nodes are unchanged.

@@ -10,10 +10,13 @@ Chebyshev ridge-regression fit. Works with any ComfyUI sampler (Euler,
 DPM, er_sde, etc.) because caching is handled transparently inside the
 model_function_wrapper.
 
-Three node tiers:
+Node tiers:
   - SpectrumKSampler: basic drop-in, sensible defaults
   - SpectrumKSamplerModGuidance: + modulation guidance (adapter, quality tags, w)
   - SpectrumKSamplerAdvanced: + full Spectrum tuning + modulation guidance
+  - SpectrumSPDKSampler (SPEED): + SPD multi-resolution prefix (low-res early,
+    spectral-expand to full res at the handoff, Spectrum-forecasted tail)
+  - AnimaModGuidance: standalone mod-guidance model patcher (composes with any sampler)
 """
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

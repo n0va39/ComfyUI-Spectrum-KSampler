@@ -50,6 +50,13 @@ class SMCCFGState:
         guidance_scale: float,
     ) -> torch.Tensor:
         e = v_cond - v_uncond
+        # Resolution can change mid-loop (SPD/SPEED spectral expansion at the
+        # low→full handoff): the stored previous-step residual then carries a
+        # stale spatial shape and can't form the sliding surface. Treat the
+        # handoff as a cold start — drop the stale history, like Spectrum's
+        # reset() at the same boundary.
+        if self._e_prev is not None and self._e_prev.shape != e.shape:
+            self._e_prev = None
         e_prev = e if self._e_prev is None else self._e_prev
         s = (e - e_prev) + self.lam * e_prev
         k_t = self.alpha * e.abs().mean().clamp_min(1e-12)

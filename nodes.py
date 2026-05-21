@@ -199,7 +199,7 @@ _SPECTRUM_INPUTS = {
     "warmup_steps": (
         "INT",
         {
-            "default": 7,
+            "default": 6,
             "min": 0,
             "max": 50,
             "tooltip": "Number of initial steps that always run actual forwards.",
@@ -239,11 +239,61 @@ _SPECTRUM_INPUTS = {
 _SPECTRUM_DEFAULTS = dict(
     window_size=2.0,
     flex_window=0.25,
-    warmup_steps=7,
+    warmup_steps=6,
     blend_w=0.3,
     cheby_degree=3,
     ridge_lambda=0.1,
 )
+
+# SPD / SPEED: multi-resolution progressive diffusion composed with Spectrum
+# (naive-reset compose, validated in anima_lora/bench/spd/compose_report.md).
+# Low-res prefix runs uncached; at σ=spd_sigma the latent is spectral-expanded
+# to full res and Spectrum forecasts the tail. Euler-only.
+_SPD_INPUTS = {
+    "split_mode": (
+        ["single"],
+        {
+            "default": "single",
+            "tooltip": (
+                "SPD resolution schedule. 'single' = one low→full transition "
+                "(v0). The low-res prefix runs at spd_scale, then expands to full "
+                "resolution at σ=spd_sigma."
+            ),
+        },
+    ),
+    "spd_scale": (
+        "FLOAT",
+        {
+            "default": 0.5,
+            "min": 0.25,
+            "max": 1.0,
+            "step": 0.05,
+            "round": 0.01,
+            "tooltip": (
+                "Prefix resolution scale (fraction of full latent H/W) for the "
+                "low-res phase. 0.5 = quarter the tokens, the benched-coherent "
+                "point. 1.0 disables SPD (vanilla Spectrum). Lower than 0.5 is "
+                "untested and stresses the handoff re-warm."
+            ),
+        },
+    ),
+    "spd_sigma": (
+        "FLOAT",
+        {
+            "default": 0.7,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.01,
+            "round": 0.001,
+            "tooltip": (
+                "Handoff σ: switch from low-res to full-res when the schedule "
+                "drops to this noise level. 0.7 is the validated knee (re-warm "
+                "overlaps Spectrum's natural warmup, so it's cheap). Later/lower "
+                "knees and HF-detail prompts are untested. 1.0 disables SPD."
+            ),
+        },
+    ),
+}
 
 # SMC-CFG: α-adaptive sliding-mode CFG combine (Wang et al., arXiv:2603.03281,
 # Anima α-adaptive form — see anima_lora/docs/methods/smc_cfg.md). Replaces the
@@ -600,14 +650,141 @@ class SpectrumKSamplerAdvanced:
         )
 
 
+class AnimaModGuidance:
+    """Standalone modulation-guidance model patcher.
+
+    Pulls the quality-steering setup out of the sampler so it composes with any
+    sampler (vanilla KSampler, Spectrum, or the SPEED node) by sitting upstream
+    on the MODEL input. Returns a patched MODEL clone — the actual positive /
+    negative conditioning is still wired into the sampler as usual; this node
+    reads them only to compute the steering delta direction.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "Model to patch with mod guidance."}),
+                **_MOD_GUIDANCE_SIMPLE_INPUTS,
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches"
+    DESCRIPTION = (
+        "Modulation guidance as a standalone model patcher. Steers generation "
+        "toward quality tags via a learned pooled-text projection into the AdaLN "
+        "timestep embedding (the default ~12MB adapter is auto-downloaded on "
+        "first use). Wire its output MODEL into any sampler — composes with the "
+        "Spectrum and SPEED (Spectrum+SPD) samplers. Set mod_w_profile='off' to "
+        "pass the model through unchanged."
+    )
+
+    def patch(self, model, clip, quality_tags, mod_w_profile, positive, negative):
+        if mod_w_profile == MOD_W_PROFILE_OFF:
+            return (model,)
+        profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
+        m = model.clone()
+        setup_mod_guidance(
+            m,
+            clip,
+            positive,
+            negative,
+            None,
+            quality_tags,
+            profile["w"],
+            start_layer=profile["start_layer"],
+            end_layer=profile["end_layer"],
+            taper=profile["taper"],
+            taper_scale=profile["taper_scale"],
+            final_w=profile["final_w"],
+        )
+        return (m,)
+
+
+class SpectrumSPDKSampler:
+    """KSampler (Spectrum + SPD) — the SPEED sampler.
+
+    Low-res SPD prefix (uncached) → spectral expansion at the handoff →
+    Spectrum-forecasted full-res tail. Consumes whatever MODEL it is given, so
+    mod guidance composes by sitting upstream (AnimaModGuidance node).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                **_KSAMPLER_INPUTS,
+                **_SPD_INPUTS,
+                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "sampling"
+    DESCRIPTION = (
+        "SPEED sampler: SPD multi-resolution progressive diffusion composed with "
+        "Spectrum. Runs the low-res prefix (spd_scale) uncached, spectral-expands "
+        "to full resolution at σ=spd_sigma, then Spectrum forecasts the full-res "
+        "tail (phase-2-only naive-reset compose, validated at scale 0.5 / σ0.7). "
+        "Stacks SPD's token saving on Spectrum's block saving. Euler-only "
+        "(the σ schedule is re-spaced mid-loop). Mod guidance composes via the "
+        "upstream AnimaModGuidance node. DCW lives on the Spectrum Advanced node."
+    )
+
+    def sample(
+        self,
+        model,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        split_mode,
+        spd_scale,
+        spd_sigma,
+        denoise=1.0,
+        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+    ):
+        return spectrum_sample(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise,
+            **_SPECTRUM_DEFAULTS,
+            dcw_mode="off",
+            smc_cfg_alpha=adaptive_smc_alpha,
+            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+            spd_scale=spd_scale,
+            spd_sigma=spd_sigma,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "SpectrumKSampler": SpectrumKSampler,
     "SpectrumKSamplerModGuidance": SpectrumKSamplerModGuidance,
     "SpectrumKSamplerAdvanced": SpectrumKSamplerAdvanced,
+    "SpectrumSPDKSampler": SpectrumSPDKSampler,
+    "AnimaModGuidance": AnimaModGuidance,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumKSampler": "KSampler (Spectrum)",
     "SpectrumKSamplerModGuidance": "KSampler (Spectrum + Mod Guidance)",
     "SpectrumKSamplerAdvanced": "KSampler (Spectrum + Mod Guidance Advanced)",
+    "SpectrumSPDKSampler": "KSampler (Spectrum + SPD / SPEED)",
+    "AnimaModGuidance": "Anima Mod Guidance (model patch)",
 }
