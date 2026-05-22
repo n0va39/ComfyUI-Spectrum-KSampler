@@ -28,7 +28,9 @@ _ODD_LATENT_WARNED = False
 
 
 def _pad_latent_to_patch_multiple(t: torch.Tensor, patch: int = _PATCH_MULTIPLE):
-    """Replicate-pad bottom/right of a 4-D latent to the next multiple of ``patch``.
+    """Replicate-pad bottom/right of a latent to the next multiple of ``patch``.
+
+    Handles both 4-D ``(B, C, H, W)`` and 5-D video-DiT ``(B, C, T, H, W)`` latents.
 
     Returns ``(padded, (H, W))`` where (H, W) are the original spatial dims.
     The caller crops the sampled output back to (H, W) before returning to
@@ -49,7 +51,13 @@ def _pad_latent_to_patch_multiple(t: torch.Tensor, patch: int = _PATCH_MULTIPLE)
             H, W, patch, H + pad_h, W + pad_w, patch * 8,
         )
         _ODD_LATENT_WARNED = True
-    return F.pad(t, (0, pad_w, 0, pad_h), mode="replicate"), (H, W)
+    # 5-D video-DiT latents (B, C, T, H, W) need a size-6 pad tuple under
+    # "replicate"; pad W/H and leave the temporal (and leading) dims untouched.
+    if t.ndim >= 5:
+        pad = (0, pad_w, 0, pad_h, 0, 0)
+    else:
+        pad = (0, pad_w, 0, pad_h)
+    return F.pad(t, pad, mode="replicate"), (H, W)
 
 
 def _spectrum_fast_forward(
