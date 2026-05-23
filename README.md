@@ -13,6 +13,7 @@ Tuned for the [Anima](https://github.com/sorryhyun/anima_lora) DiT — its modul
 - [SMC-CFG (α-adaptive sliding-mode CFG)](#smc-cfg-α-adaptive-sliding-mode-cfg) — velocity-space CFG combine modification
 - [DCW post-step bias correction](#dcw-post-step-bias-correction) — sampler-level SNR-t bias correction (Advanced node)
 - [SPEED (Spectrum + SPD multi-resolution)](#speed-spectrum--spd-multi-resolution) — low-res prefix + spectral expansion, stacked on Spectrum
+  - [Auto-scheduled LoRA-SPD node](#auto-scheduled-lora-spd-node) — loads an SPD-trained LoRA and reads its schedule from metadata
 
 The feature blocks compose cleanly — they intervene at distinct points in the sampling loop (AdaLN → CFG combine → post-step x-space → and the SPEED node, which owns the loop).
 
@@ -144,6 +145,17 @@ This is the **naive-reset compose** validated in [`bench/spd/compose_report.md`]
 | `spd_sigma` | `0.7` | Handoff σ: switch low→full when the schedule drops to this noise level. `0.7` is the validated knee. `1.0` disables SPD. |
 
 **Caveats.** SPD re-spaces the σ schedule mid-loop, so the SPEED sampler is **Euler-only** (any other `sampler_name` is ignored with a warning). The scale `0.5` / σ `0.7` point is the only benched-coherent config — **lower scales or later/more-aggressive knees are untested** and stress the handoff re-warm (especially on HF-detail prompts). The reported block-skip ratio in the log understates the true speedup because it counts the cheaper low-res prefix forwards as full forwards.
+
+### Auto-scheduled LoRA-SPD node
+
+The **KSampler (SPD LoRA / auto-schedule)** node is for adapters distilled by the SPD trajectory-adapter workflow (`anima_lora` `make exp-spd`). Such a LoRA is fit to a specific resolution schedule and snapshots it into its safetensors metadata (`ss_spd_stages` / `ss_spd_transition_sigmas`). This node **loads the LoRA onto the MODEL itself** (pick it from the `lora_name` dropdown, `lora_strength` weights it) and reads that metadata to drive the SPEED sampler automatically — so inference geometry matches what the adapter trained on, with no manual scale/σ tuning. There are no schedule knobs by design.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `lora_name` | — | The SPD-trained LoRA. Its schedule is read from the file metadata. |
+| `lora_strength` | `1.0` | LoRA weight multiplier applied to the MODEL. |
+
+Unlike the base SPEED node, this node honors **multi-stage** schedules (e.g. `[0.5, 0.75, 1.0]` with `[0.7, 0.4]`): it spectral-expands at each handoff and only arms Spectrum once the trajectory reaches full resolution. If the selected LoRA happens to carry no schedule metadata, it falls back to the validated `0.5` / σ`0.7` single handoff (with a warning). To stack a style LoRA or mod guidance, chain a stock `LoraLoader` / **Anima Mod Guidance** node upstream on the MODEL input. Euler-only and the SPEED caveats above still apply.
 
 ### Modulation guidance as a standalone patcher
 

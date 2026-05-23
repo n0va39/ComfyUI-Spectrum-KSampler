@@ -1,10 +1,17 @@
 """ComfyUI node definitions for Spectrum inference acceleration."""
 
+import json
+import logging
+
 import comfy.samplers
+import comfy.sd
+import comfy.utils
 import folder_paths
 
 from .mod_guidance import AUTO_ADAPTER_SENTINEL, setup_mod_guidance
 from .spectrum import spectrum_sample
+
+logger = logging.getLogger(__name__)
 
 AUTO_CALIBRATOR_SENTINEL = "(auto-download default)"
 
@@ -294,6 +301,49 @@ _SPD_INPUTS = {
         },
     ),
 }
+
+# LoRA-SPD: an SPD-trained LoRA snapshots the resolution schedule it was fit to
+# into safetensors metadata (ss_spd_stages / ss_spd_transition_sigmas, written by
+# anima_lora/scripts/distill_spd.py). Reading it back lets the node auto-configure
+# the SPEED sampler so train/infer geometry stays aligned with no manual tuning.
+# If a selected LoRA carries no schedule metadata, fall back to the validated
+# single-handoff knee rather than erroring.
+SPD_FALLBACK_SCALE = 0.5
+SPD_FALLBACK_SIGMA = 0.7
+
+
+def _read_spd_schedule_meta(lora_name):
+    """Read (stages, transition_sigmas, label) from an SPD LoRA's metadata.
+
+    Returns ``(None, None, None)`` if the file has no schedule metadata or can't
+    be read (e.g. a non-safetensors LoRA) — the caller then falls back to the
+    manual scalars rather than hard-erroring.
+    """
+    from safetensors import safe_open
+
+    lora_path = folder_paths.get_full_path("loras", lora_name)
+    if lora_path is None:
+        return None, None, None
+    try:
+        with safe_open(lora_path, framework="pt") as f:
+            md = f.metadata() or {}
+    except Exception as e:  # not safetensors / unreadable header
+        logger.warning("SPD LoRA: could not read metadata from %s: %s", lora_name, e)
+        return None, None, None
+
+    label = md.get("ss_spd_schedule_label")
+    raw_stages = md.get("ss_spd_stages")
+    raw_trans = md.get("ss_spd_transition_sigmas")
+    try:
+        stages = [float(v) for v in json.loads(raw_stages)] if raw_stages else None
+        trans = [float(v) for v in json.loads(raw_trans)] if raw_trans else None
+    except (ValueError, TypeError) as e:
+        logger.warning(
+            "SPD LoRA: malformed schedule metadata in %s: %s", lora_name, e
+        )
+        return None, None, label
+    return stages, trans, label
+
 
 # SMC-CFG: α-adaptive sliding-mode CFG combine (Wang et al., arXiv:2603.03281,
 # Anima α-adaptive form — see anima_lora/docs/methods/smc_cfg.md). Replaces the
@@ -773,11 +823,139 @@ class SpectrumSPDKSampler:
         )
 
 
+class SpectrumSPDLoRAKSampler:
+    """KSampler (SPD LoRA) — loads an SPD-trained LoRA and auto-schedules SPEED.
+
+    A LoRA distilled by the SPD trajectory-adapter workflow (anima_lora
+    ``make exp-spd``) is fit to a specific resolution schedule and snapshots it
+    into its safetensors metadata. This node loads such a LoRA onto the MODEL and
+    reads ``ss_spd_stages`` / ``ss_spd_transition_sigmas`` to drive the SPEED
+    (SPD + Spectrum) sampler automatically — no manual scale/σ tuning, and the
+    inference geometry matches what the adapter trained on. Chain a stock
+    LoraLoader / AnimaModGuidance upstream to stack style LoRAs or mod guidance.
+    """
+
+    def __init__(self):
+        self.loaded_lora = None  # (path, state_dict) cache, mirrors LoraLoader
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                **_KSAMPLER_INPUTS,
+                "lora_name": (
+                    folder_paths.get_filename_list("loras"),
+                    {
+                        "tooltip": (
+                            "SPD-trained LoRA (anima_lora make exp-spd). Its "
+                            "resolution schedule is read from the file's "
+                            "ss_spd_stages / ss_spd_transition_sigmas metadata "
+                            "and applied automatically."
+                        ),
+                    },
+                ),
+                "lora_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": -10.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "LoRA weight multiplier applied to the MODEL.",
+                    },
+                ),
+                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "sampling"
+    DESCRIPTION = (
+        "Loads an SPD-trained LoRA and runs the SPEED (SPD + Spectrum) sampler "
+        "with the resolution schedule auto-read from the adapter's metadata "
+        "(ss_spd_stages / ss_spd_transition_sigmas — supports multi-stage). "
+        "Aligns inference geometry with training, no manual scale/σ tuning. "
+        "Euler-only (σ is re-spaced mid-loop). Falls back to the validated "
+        "0.5 / σ0.7 single handoff only if the LoRA carries no schedule metadata. "
+        "Mod guidance / extra LoRAs compose via upstream nodes; DCW lives on the "
+        "Spectrum Advanced node."
+    )
+
+    def _apply_lora(self, model, lora_name, strength):
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        lora = None
+        if self.loaded_lora is not None:
+            if self.loaded_lora[0] == lora_path:
+                lora = self.loaded_lora[1]
+            else:
+                self.loaded_lora = None
+        if lora is None:
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_lora = (lora_path, lora)
+        # clip=None / strength_clip=0: model-only patch (LoraLoaderModelOnly form).
+        model_lora, _ = comfy.sd.load_lora_for_models(model, None, lora, strength, 0)
+        return model_lora
+
+    def sample(
+        self,
+        model,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        lora_name,
+        lora_strength,
+        denoise=1.0,
+        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+    ):
+        m = self._apply_lora(model, lora_name, lora_strength)
+
+        spd_stages, spd_transition_sigmas, label = _read_spd_schedule_meta(lora_name)
+        if spd_stages is None:
+            logger.warning(
+                "SPD LoRA '%s' has no ss_spd_stages metadata; falling back to the "
+                "validated %.2f / σ%.2f single handoff.",
+                lora_name, SPD_FALLBACK_SCALE, SPD_FALLBACK_SIGMA,
+            )
+        else:
+            logger.info(
+                "SPD LoRA '%s': auto schedule label=%s stages=%s σ=%s",
+                lora_name, label, spd_stages, spd_transition_sigmas,
+            )
+
+        return spectrum_sample(
+            m,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise,
+            **_SPECTRUM_DEFAULTS,
+            dcw_mode="off",
+            smc_cfg_alpha=adaptive_smc_alpha,
+            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+            spd_scale=SPD_FALLBACK_SCALE,
+            spd_sigma=SPD_FALLBACK_SIGMA,
+            spd_stages=spd_stages,
+            spd_transition_sigmas=spd_transition_sigmas,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "SpectrumKSampler": SpectrumKSampler,
     "SpectrumKSamplerModGuidance": SpectrumKSamplerModGuidance,
     "SpectrumKSamplerAdvanced": SpectrumKSamplerAdvanced,
     "SpectrumSPDKSampler": SpectrumSPDKSampler,
+    "SpectrumSPDLoRAKSampler": SpectrumSPDLoRAKSampler,
     "AnimaModGuidance": AnimaModGuidance,
 }
 
@@ -786,5 +964,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumKSamplerModGuidance": "KSampler (Spectrum + Mod Guidance)",
     "SpectrumKSamplerAdvanced": "KSampler (Spectrum + Mod Guidance Advanced)",
     "SpectrumSPDKSampler": "KSampler (Spectrum + SPD / SPEED)",
+    "SpectrumSPDLoRAKSampler": "KSampler (SPD LoRA / auto-schedule)",
     "AnimaModGuidance": "Anima Mod Guidance (model patch)",
 }

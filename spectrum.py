@@ -209,16 +209,23 @@ def spectrum_sample(
     smc_cfg_lambda: float = 5.0,
     spd_scale: float = 1.0,
     spd_sigma: float = 1.0,
+    spd_stages=None,
+    spd_transition_sigmas=None,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
 
-    spd_scale / spd_sigma: SPD (SPEED) multi-resolution knobs. When
-        ``spd_scale < 1`` and ``0 < spd_sigma < 1`` the denoise loop is driven by
-        the custom SPEED sampler (see ``spd.make_speed_sampler``): the
-        ``spd_scale`` low-res prefix runs uncached, then at ``σ ≤ spd_sigma`` the
-        latent is spectral-expanded to full resolution and Spectrum forecasts the
-        tail (phase-2-only naive-reset compose; ``bench/spd/compose_report.md``).
+    spd_scale / spd_sigma: legacy single-handoff SPD (SPEED) multi-resolution
+        knobs. When ``spd_scale < 1`` and ``0 < spd_sigma < 1`` the denoise loop
+        is driven by the custom SPEED sampler (see ``spd.make_speed_sampler``):
+        the ``spd_scale`` low-res prefix runs uncached, then at ``σ ≤ spd_sigma``
+        the latent is spectral-expanded to full resolution and Spectrum forecasts
+        the tail (phase-2-only naive-reset compose; ``bench/spd/compose_report.md``).
         Forces Euler. Defaults (1.0, 1.0) = no SPD, vanilla Spectrum path.
+    spd_stages / spd_transition_sigmas: explicit multi-stage schedule (lists),
+        e.g. ``[0.5, 0.75, 1.0]`` / ``[0.7, 0.4]``. When given they take
+        precedence over the scalars above — this is how the LoRA-SPD node feeds a
+        schedule read from an SPD-trained adapter's ``ss_spd_*`` metadata. See
+        ``spd.resolve_spd_schedule``.
 
     dcw_mode: "off" / "manual" / "auto".
         - off: no DCW correction.
@@ -389,7 +396,11 @@ def spectrum_sample(
     # runs through a custom KSAMPLER via sample_custom rather than the string
     # sampler path. Everything upstream (SMC / DCW / mod-guidance / the Spectrum
     # wrapper + capture hook) is already installed on ``m`` and composes.
-    spd_active = spd_scale < 1.0 and 0.0 < spd_sigma < 1.0
+    from .spd import make_speed_sampler, resolve_spd_schedule
+
+    spd_stages_r, spd_trans_r, spd_active = resolve_spd_schedule(
+        spd_stages, spd_transition_sigmas, spd_scale, spd_sigma
+    )
     if spd_active and sampler_name != "euler":
         logger.warning(
             "SPEED/SPD re-spaces σ mid-loop and is Euler-only; ignoring requested "
@@ -399,8 +410,6 @@ def spectrum_sample(
 
     try:
         if spd_active:
-            from .spd import make_speed_sampler
-
             # Phase-2-only: the SPEED sampler flips state.active True at the handoff.
             state.active = False
             ks = comfy.samplers.KSampler(
@@ -412,7 +421,7 @@ def spectrum_sample(
                 denoise=denoise,
                 model_options=m.model_options,
             )
-            sampler_obj = make_speed_sampler(state, spd_scale, spd_sigma, seed)
+            sampler_obj = make_speed_sampler(state, spd_stages_r, spd_trans_r, seed)
             samples = comfy.sample.sample_custom(
                 m,
                 noise,
