@@ -416,13 +416,45 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
     transformer_options = args[5] if len(args) > 5 and isinstance(args[5], dict) else kwargs.get("transformer_options", {})
     mod_state = transformer_options.get(MOD_STATE_KEY)
     if mod_state is None:
+        # The wrapper is only ever installed by setup_mod_guidance, so reaching
+        # here means MOD_STATE_KEY was dropped from transformer_options between
+        # setup and sampling — mod guidance silently no-ops. Warn once.
+        owner = getattr(executor, "class_obj", None)
+        if owner is not None and not getattr(owner, "_anima_mod_state_missing_warned", False):
+            logger.warning(
+                "[mod-guidance] wrapper fired but MOD_STATE_KEY missing from "
+                "transformer_options -> mod guidance is a NO-OP this run. "
+                "transformer_options keys: %s",
+                sorted(k for k in transformer_options.keys() if isinstance(k, str)),
+            )
+            owner._anima_mod_state_missing_warned = True
         return executor(*args, **kwargs)
 
     x = args[0]
     device = x.device
     model = executor.class_obj  # BaseModel
     dtype = model.get_dtype_inference()
-    dit = mod_state.dit  # original diffusion_model ref captured at setup
+
+    # Bind to the LIVE diffusion_model — the module that actually runs this
+    # forward — not the ref captured at setup. ComfyUI can hand the sampler a
+    # different DiT instance than the one AnimaModGuidance patched upstream (e.g.
+    # the model gets re-instantiated between the patcher node and the sampler),
+    # which strands the hooks + steering state on a dead module and silently
+    # no-ops mod guidance. Re-home here and install the hooks on the live module.
+    dit = getattr(model, "diffusion_model", mod_state.dit)
+    if dit is None:
+        return executor(*args, **kwargs)
+    if mod_state.dit is not dit:
+        logger.info(
+            "[mod-guidance] re-homing to live diffusion_model "
+            "(captured id=%x != live id=%x); installing hooks on live module.",
+            id(mod_state.dit) & 0xffffff, id(dit) & 0xffffff,
+        )
+        mod_state.dit = dit
+        mod_state.cond_combined = None  # invalidate precompute against stale module
+    # Idempotent: no-ops once the live module is hooked.
+    _ensure_t_emb_hook(dit)
+    _ensure_block_hooks(dit)
 
     # Lazy one-shot: run LLM adapter + projection for pos/neg/tag and build
     # the two (1, C) combined tensors. Subsequent calls early-out.
