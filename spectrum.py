@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import inspect
 import logging
 import math
@@ -1035,15 +1034,8 @@ def _require_dit_spectrum_components(model):
 
 
 def _clone_model_options(model):
-    try:
-        model.model_options = copy.deepcopy(model.model_options)
-    except Exception as e:
-        logger.warning(
-            "DiT Spectrum Patch: deepcopy(model_options) failed (%s); using a "
-            "shallow copy for wrapper isolation.",
-            e,
-        )
-        model.model_options = dict(model.model_options)
+    """Copy option containers without duplicating tensor or module state."""
+    model.model_options = comfy.utils.deepcopy_list_dict(model.model_options)
 
 
 def _normalize_cond_or_uncond(args, batch_size: int):
