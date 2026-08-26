@@ -1,6 +1,5 @@
 """ComfyUI node definitions for Spectrum inference acceleration."""
 
-import copy
 import json
 import logging
 import math
@@ -727,15 +726,8 @@ _FSG_INPUTS = {
 
 
 def _clone_model_options(model):
-    """Copy model_options so model patch nodes do not mutate the input MODEL."""
-    try:
-        model.model_options = copy.deepcopy(model.model_options)
-    except Exception as e:
-        logger.warning(
-            "DiT model patch: deepcopy(model_options) failed (%s); using a shallow copy.",
-            e,
-        )
-        model.model_options = dict(model.model_options)
+    """Copy option containers without duplicating tensor or module state."""
+    model.model_options = comfy.utils.deepcopy_list_dict(model.model_options)
 
 
 def _missing_option_error(feature_name, missing, *, hint):
