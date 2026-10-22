@@ -165,6 +165,14 @@ existing model-function-wrapper policy are shared with the original Spectrum
 implementation. Verbose logs report actual and forecast call counts; an enabled
 patch is not a claim that a particular short schedule skipped any calls.
 
+Compilation also depends on the checkpoint's kernels. On ComfyUI v0.42.1,
+the tested MOSS INT8/ConvRot checkpoint failed Inductor tracing in Comfy Kitchen
+attention and fused INT8 linear operations even with Spectrum disabled.
+Changing attention alone did not resolve the fused-linear failure. This is
+separate from Spectrum wrapper composition; use the checkpoint without block
+compilation until its kernels support tracing. Spectrum does not silently
+disable compilation or replace the model's attention implementation.
+
 The adapter reuses the existing MOSS token forecaster and Spectrum cache/branch
 policy. Shared code owns forecasting and sampling-state lifetime, while the
 model-specific module owns identification, feature capture and output-head
