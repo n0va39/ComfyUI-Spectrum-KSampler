@@ -119,6 +119,45 @@ MOSS-Image loader -> KSampler (Spectrum for MOSS) -> VAE Decode
 - **Compile** (`compile`, on by default). The node runs `torch.compile` on each of `diffusion_model.layers` with dynamic shapes. MOSS never pads prompts, so the joint length changes with every prompt and between cond and uncond. Compilation happens on the first sample. Without a C++ compiler the node falls back to eager. Compiled blocks need a non-dynamic-VRAM copy of the DiT. The node builds that copy once per checkpoint and reuses it, so it stays in host RAM next to ComfyUI's own copy.
 - **Measured** sampling time (1024², 50 steps, NVIDIA GeForce RTX 5070 Ti): stock `ModelSamplingSD3` → `SkipLayerGuidanceDiTSimple` → `KSampler` 68 s; this node 25.9 s with compile off, 21.2 s with compile on.
 
+### MODEL patch for ComfyUI's built-in MOSS loader
+
+For MOSS-Image loaded by **ComfyUI's built-in loader**, use
+**Spectrum Model Patch (MOSS)** before a standard sampler:
+
+```text
+ComfyUI MOSS MODEL -> Spectrum Model Patch (MOSS) -> KSampler / Custom Sampler
+```
+
+Here, "native" in the internal node ID `NativeMossSpectrumPatch` refers to
+ComfyUI's own MOSS implementation; Spectrum is supplied by this extension.
+The original `KSampler (Spectrum for MOSS)` above still uses its existing
+custom-loader path. Choose the node that matches your loader.
+
+This MODEL patch preserves model sampling, CFG and flow shift. It does not add
+trained Mod Guidance, SPD, skip-layer guidance or compilation.
+
+Each downstream sampling invocation gets fresh forecast state using the actual
+sigma schedule, including partial-denoise Highres, Detailer cycles and USDU
+tiles. The `steps` input remains for workflow compatibility; it does not
+override that schedule. `one_sampler_only` limits the patch to the first
+nonempty sampling invocation in a workflow execution. Warmup and final-tail
+steps always compute the model, and a short schedule may do no forecasting.
+
+The adapter falls back to full computation for ControlNet inputs, active
+scheduled weight hooks, APPLY_MODEL/DIFFUSION_MODEL wrappers and replacement of
+the last transformer block. Unknown model-function wrappers also fall back
+under the default conservative policy. Direct forwards outside a sampler scope
+compute normally. Fixed LoRA weights still pass through the model's own head
+modules; this does not establish compatibility with every external patch
+combination. Compare against `enabled=false` for your prompts and resolutions.
+
+The adapter reuses the existing MOSS token forecaster and Spectrum cache/branch
+policy. Shared code owns forecasting and sampling-state lifetime, while the
+model-specific module owns identification, feature capture and output-head
+reconstruction. Architecture imports are lazy so an older ComfyUI can still
+load the original nodes. Using this patch requires a ComfyUI build that
+includes its own MOSS-Image implementation.
+
 ### Standalone correction patchers
 
 The extra correction features are also available as standalone `MODEL -> MODEL` patches. These patchers are tuned for Anima-style flow-matching DiTs. They may run on other DiT models that expose compatible ComfyUI sampler semantics, but quality and stability are not guaranteed there.
