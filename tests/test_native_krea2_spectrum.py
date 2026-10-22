@@ -233,6 +233,30 @@ class NativeKrea2SpectrumTest(unittest.TestCase):
                 run_sample(model, tuple(1 - i / steps for i in range(steps + 1)))
                 self.assertEqual(model.model.blocks - count, steps)
 
+    def test_shared_runner_keeps_replacement_context_keys_separate(self):
+        # Current native Krea2 does not dispatch patches_replace. This verifies
+        # shared-runner identity and lifetime, not Krea2 SLG support.
+        model = accelerated(compat_policy="strict")
+        ordinary = {"uuids": ["same-conditioning"]}
+        replacement = dict(ordinary, patches_replace={"dit": {("single_block", 0): lambda a, e: a}})
+        states = []
+
+        def body():
+            wrapper = model.model_options["model_function_wrapper"]
+            state = inspect.getclosurevars(wrapper).nonlocals["native_scope"].get()
+            states.append(state)
+            for sigma in (1.0, 0.875, 0.75):
+                run_step(model, sigma, options=ordinary)
+                run_step(model, sigma, options=replacement)
+            self.assertEqual(len(state.forecasters), 2)
+            self.assertEqual(model.model.blocks, 6)
+            run_step(model, 0.625, options=ordinary)
+            run_step(model, 0.625, options=replacement)
+            self.assertEqual(model.model.blocks, 6)
+
+        run_sample(model, body=body)
+        self.assertFalse(states[0].native_patch_callables)
+
     def test_repeated_invocations_match_fresh_with_changed_crop_branch_and_temporal(self):
         reused = accelerated()
         for options in ({}, {"value": 2.0}, {"branch": 1}, {"width": 7}, {"temporal": True, "batch": 2}):
