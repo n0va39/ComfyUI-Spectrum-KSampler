@@ -65,6 +65,12 @@ class Base:
         self.fail = False
 
     def apply_model(self, x, sigma, c_crossattn, transformer_options=None):
+        options = {} if transformer_options is None else transformer_options
+        return WrapperExecutor.new_class_executor(
+            self._apply_model, self, get_all_wrappers(WrappersMP.APPLY_MODEL, options)
+        ).execute(x, sigma, c_crossattn, options)
+
+    def _apply_model(self, x, sigma, c_crossattn, transformer_options):
         self.calls += 1
         out = self.diffusion_model(
             x, self.model_sampling.timestep(sigma).float(), c_crossattn,
@@ -85,6 +91,17 @@ class Patcher:
 
     def set_model_unet_function_wrapper(self, wrapper):
         self.model_options["model_function_wrapper"] = wrapper
+
+    def get_model_object(self, key):
+        import comfy.utils
+        return comfy.utils.get_attr(self.model, key)
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        from comfy.patcher_extension import add_wrapper_with_key
+        add_wrapper_with_key(wrapper_type, key, wrapper, self.model_options, is_model_options=True)
+
+    def remove_wrappers_with_key(self, wrapper_type, key):
+        self.model_options.get("transformer_options", {}).get("wrappers", {}).get(wrapper_type, {}).pop(key, None)
 
 
 def state_of(model):
@@ -287,7 +304,7 @@ class NativeMossSpectrumTest(unittest.TestCase):
         for actual, expected in zip(run_sample(model), run_sample(fresh)):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_clones_share_only_neutral_hook_and_keep_forecasts_separate(self):
+    def test_clones_leave_no_capture_hook_and_keep_forecasts_separate(self):
         base = Patcher()
         args = (torch.ones(1, 8, 2, 3), torch.tensor([0.5]), torch.ones(1, 3, 16))
         with torch.inference_mode():
@@ -314,7 +331,7 @@ class NativeMossSpectrumTest(unittest.TestCase):
             self.assertEqual(base.model.calls, count)
         run_sample(first, body=first_body)
         block = base.model.diffusion_model.layers[-1]
-        self.assertEqual(len(block._forward_hooks), 1)
+        self.assertEqual(len(block._forward_hooks), 0)
         self.assertFalse(hasattr(block, "_native_spectrum_state"))
         self.assertIsNone(state_of(first))
         self.assertIsNone(model_patch._NATIVE_CAPTURE.get())

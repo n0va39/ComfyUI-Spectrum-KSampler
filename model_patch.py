@@ -28,14 +28,9 @@ def record_feature(module, tensor):
 
 
 def _capture_safe(adapter, dit, input_x, c, apply_model):
-    from comfy.patcher_extension import WrappersMP, get_all_wrappers
-
-    options = c.get("transformer_options", {})
     patcher = getattr(getattr(apply_model, "__self__", None), "current_patcher", None)
     return (
         c.get("control") is None
-        and not get_all_wrappers(WrappersMP.APPLY_MODEL, options)
-        and not get_all_wrappers(WrappersMP.DIFFUSION_MODEL, options)
         # Scheduled weight hooks can change weights without changing model ID.
         and not getattr(patcher, "hook_patches", None)
         and not getattr(patcher, "current_hooks", None)
@@ -62,13 +57,16 @@ def apply_spectrum_model_patch(
         verbose=verbose, one_sampler_only=one_sampler_only, compat_policy=compat_policy,
     )
     native_scope = ContextVar(adapter.key, default=None)
-    adapter.capture_owner(dit)
+    _install_capture_scope(patched, adapter)
     _install_sampling_scope(patched, dit, configured, native_scope, adapter.key)
     old_wrapper = patched.model_options.get("model_function_wrapper")
     # Do not capture the patcher: it would form a reference cycle.
     model_options = patched.model_options
 
     def actual_forward(apply_model, args):
+        state = native_scope.get()
+        if state is not None:
+            state.native_actual += 1
         if old_wrapper is not None:
             return old_wrapper(apply_model, args)
         return apply_model(args["input"], args["timestep"], **args["c"])
@@ -84,11 +82,11 @@ def apply_spectrum_model_patch(
         if state.native_live_id != id(live_dit):
             state.reset()
             state.native_live_id = id(live_dit)
-        owner = adapter.capture_owner(live_dit)
         new_step = _advance_spectrum_state(state, timestep.flatten()[0].item())
         if not _capture_safe(adapter, live_dit, input_x, c, apply_model):
             state.clear_forecasters()
             state.mode = "actual"
+            state.native_fallbacks += 1
             _mark_spectrum_patch_consumed(state)
             return actual_forward(apply_model, args)
 
@@ -107,13 +105,14 @@ def apply_spectrum_model_patch(
         ):
             feat = torch.cat([state.forecasters[k].predict(float(state.step_idx)) for k in keys])
             out = adapter.head(live_dit, live_sampling.timestep(timestep).float(), feat, input_x)
+            state.native_forecast += 1
             _mark_spectrum_patch_consumed(state)
             return live_sampling.calculate_denoised(timestep, out.float(), input_x)
 
         state.mode = "actual"
         state.features = []
         token = _NATIVE_CAPTURE.set((
-            owner, state, lambda tensor: adapter.extract_features(tensor, input_x, c),
+            None, state, lambda tensor: adapter.extract_features(tensor, input_x, c),
         ))
         try:
             result = actual_forward(apply_model, args)
@@ -137,6 +136,28 @@ def apply_spectrum_model_patch(
     return patched
 
 
+def _install_capture_scope(model, adapter):
+    from comfy.patcher_extension import WrappersMP, add_wrapper_with_key
+
+    def capture_wrapper(executor, *args, **kwargs):
+        capture = _NATIVE_CAPTURE.get()
+        if capture is None:
+            return executor(*args, **kwargs)
+        # APPLY_MODEL optimizations have now swapped their live modules and
+        # installed hooks. Observe after them, then remove our hook on every exit.
+        owner, handle = adapter.capture(executor.class_obj)
+        token = _NATIVE_CAPTURE.set((owner, capture[1], capture[2]))
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            handle.remove()
+            _NATIVE_CAPTURE.reset(token)
+
+    options = model.model_options.setdefault("transformer_options", {})
+    add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, adapter.key + "_capture",
+                         capture_wrapper, options)
+
+
 def _install_sampling_scope(model, dit, configured, scope, key):
     from comfy.patcher_extension import WrappersMP, add_wrapper_with_key
 
@@ -152,6 +173,9 @@ def _install_sampling_scope(model, dit, configured, scope, key):
                 verbose=configured.verbose, one_sampler_only=False, compat_policy=configured.compat_policy,
             )
             state.native_live_id = id(dit)
+            state.native_actual = 0
+            state.native_forecast = 0
+            state.native_fallbacks = 0
             if configured.one_sampler_only:
                 configured.patch_consumed = True
                 configured.steps_seen += 1
@@ -160,6 +184,9 @@ def _install_sampling_scope(model, dit, configured, scope, key):
             return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
         finally:
             if state is not None:
+                if state.verbose:
+                    logger.info("Spectrum: sampling ended actual=%d forecast=%d fallbacks=%s",
+                                state.native_actual, state.native_forecast, state.native_fallbacks)
                 state.clear_forecasters()
                 state.features = None
             scope.reset(token)
