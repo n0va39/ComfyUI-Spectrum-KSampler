@@ -213,8 +213,11 @@ compilation.
 
 Reference-image conditioning, multiple temporal frames, post-input token patches
 and activation-quantized output heads use full computation. The common runner
-also preserves the MOSS patch's ControlNet, scheduled-hook and wrapper fallback
-rules. Each Highres pass, Detailer cycle and USDU tile gets fresh forecast state.
+also preserves the MOSS patch's ControlNet and scheduled-hook handling and the
+existing Spectrum cache policy. APPLY_MODEL/DIFFUSION_MODEL wrappers, including
+block compilation, do not require registration to forecast. Capture uses a
+temporary pre-hook on the live output head, removed after each actual forward.
+Each Highres pass, Detailer cycle and USDU tile gets fresh forecast state.
 
 The public node ID is `SpectrumKrea2ModelPatch`; `NativeKrea2SpectrumPatch`
 remains a deprecated compatibility alias for earlier workflows. Python callers
