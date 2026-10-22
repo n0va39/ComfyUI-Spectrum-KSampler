@@ -165,6 +165,12 @@ existing model-function-wrapper policy are shared with the original Spectrum
 implementation. Verbose logs report actual and forecast call counts; an enabled
 patch is not a claim that a particular short schedule skipped any calls.
 
+Per-call DiT block replacements have separate forecast histories, including
+regular and SLG calls with the same conditioning UUID. Each history needs its
+own actual observations before forecasting. CPU tests cover paired SLG calls,
+uncond SLG window transitions, UUID policy and sampling-scope cleanup. Replacing
+the last MOSS block still uses full computation because it bypasses capture.
+
 Compilation also depends on the checkpoint's kernels. On ComfyUI v0.42.1,
 the tested MOSS INT8/ConvRot checkpoint failed Inductor tracing in Comfy Kitchen
 attention and fused INT8 linear operations even with Spectrum disabled.

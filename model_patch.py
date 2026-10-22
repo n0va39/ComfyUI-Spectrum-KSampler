@@ -5,6 +5,7 @@ head. Forecast math and cache policy remain the existing Spectrum machinery.
 """
 import logging
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 import torch
 
@@ -17,6 +18,28 @@ from .spectrum import (
 
 logger = logging.getLogger(__name__)
 _NATIVE_CAPTURE = ContextVar("spectrum_native_feature_capture", default=None)
+
+
+@dataclass(frozen=True)
+class _PatchedBranch:
+    branch: int
+    replacements: frozenset
+
+
+def _model_patch_batch_keys(state, c, branches):
+    keys = _spectrum_batch_keys(c, branches)
+    replacements = c.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
+    if not replacements:
+        return keys
+    # SLG can call the same conditioning UUID with different blocks at one sigma.
+    # Snapshot the map on each call; keep callable IDs alive only for this sample.
+    context = frozenset((block, id(patch)) for block, patch in replacements.items())
+    state.native_patch_callables.update((id(patch), patch) for patch in replacements.values())
+    return [
+        (_PatchedBranch(key[0], context), key[1]) if isinstance(key, tuple)
+        else _PatchedBranch(key, context)
+        for key in keys
+    ]
 
 
 def record_feature(module, tensor):
@@ -91,11 +114,13 @@ def apply_spectrum_model_patch(
             return actual_forward(apply_model, args)
 
         branches, valid_chunks = _normalize_cond_or_uncond(args, input_x.shape[0])
-        keys = _spectrum_batch_keys(c, branches)
+        keys = _model_patch_batch_keys(state, c, branches)
         live_patcher = getattr(getattr(apply_model, "__self__", None), "current_patcher", None)
         live_options = getattr(live_patcher, "model_options", model_options)
+        # A later call at the same sigma can introduce a new SLG context. Its
+        # forecasters must be ready independently of the first call's decision.
+        state.mode = "cached" if valid_chunks and state.should_cache(keys) else "actual"
         if new_step:
-            state.mode = "cached" if valid_chunks and state.should_cache(keys) else "actual"
             if state.verbose:
                 logger.info("Spectrum for %s: step %d/%d sigma=%.6g mode=%s",
                             adapter.name, state.step_idx + 1, state.num_steps,
@@ -181,6 +206,7 @@ def _install_sampling_scope(model, dit, configured, scope, key):
             state.native_actual = 0
             state.native_forecast = 0
             state.native_fallbacks = 0
+            state.native_patch_callables = {}
             if configured.one_sampler_only:
                 configured.patch_consumed = True
                 configured.steps_seen += 1
@@ -193,6 +219,7 @@ def _install_sampling_scope(model, dit, configured, scope, key):
                     logger.info("Spectrum: sampling ended actual=%d forecast=%d fallbacks=%s",
                                 state.native_actual, state.native_forecast, state.native_fallbacks)
                 state.clear_forecasters()
+                state.native_patch_callables.clear()
                 state.features = None
             scope.reset(token)
 
