@@ -33,11 +33,12 @@ def _capture_pre_hook(module, args):
 
 
 def capture_owner(dit):
-    owner = dit.last
-    if not getattr(owner, "_spectrum_native_krea2_capture_installed", False):
-        owner.register_forward_pre_hook(_capture_pre_hook)
-        owner._spectrum_native_krea2_capture_installed = True
-    return owner
+    return dit.last
+
+
+def capture(dit):
+    owner = capture_owner(dit)
+    return owner, owner.register_forward_pre_hook(_capture_pre_hook)
 
 
 def extract_features(tensor, input_x, c):

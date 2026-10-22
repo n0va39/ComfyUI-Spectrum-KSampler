@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 try:
@@ -60,6 +61,12 @@ class Base:
         self.blocks += 1
 
     def apply_model(self, x, sigma, c_crossattn, transformer_options=None, **kwargs):
+        options = {} if transformer_options is None else transformer_options
+        return WrapperExecutor.new_class_executor(
+            self._apply_model, self, get_all_wrappers(WrappersMP.APPLY_MODEL, options)
+        ).execute(x, sigma, c_crossattn, options, **kwargs)
+
+    def _apply_model(self, x, sigma, c_crossattn, transformer_options, **kwargs):
         self.calls += 1
         out = self.diffusion_model(
             x, self.model_sampling.timestep(sigma).float(), c_crossattn,
@@ -80,6 +87,16 @@ class Patcher:
 
     def set_model_unet_function_wrapper(self, wrapper):
         self.model_options["model_function_wrapper"] = wrapper
+
+    def get_model_object(self, key):
+        return comfy.utils.get_attr(self.model, key)
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        from comfy.patcher_extension import add_wrapper_with_key
+        add_wrapper_with_key(wrapper_type, key, wrapper, self.model_options, is_model_options=True)
+
+    def remove_wrappers_with_key(self, wrapper_type, key):
+        self.model_options.get("transformer_options", {}).get("wrappers", {}).get(wrapper_type, {}).pop(key, None)
 
 
 SIGMAS = tuple(1.0 - i / 8 for i in range(9))
@@ -248,7 +265,8 @@ class NativeKrea2SpectrumTest(unittest.TestCase):
                             result = model.model_options["model_function_wrapper"](
                                 model.model.apply_model,
                                 {"input": x, "timestep": torch.full((2,), sigma),
-                                 "c": {"c_crossattn": context, "transformer_options": {}},
+                                 "c": {"c_crossattn": context, "transformer_options":
+                                       deepcopy_list_dict(model.model_options.get("transformer_options", {}))},
                                  "cond_or_uncond": [0, 1]},
                             )
                     else:
@@ -301,7 +319,7 @@ class NativeKrea2SpectrumTest(unittest.TestCase):
         one, two = run_sample(first), run_sample(second)
         for a, e in zip(one, two):
             torch.testing.assert_close(a, e, rtol=0, atol=0)
-        self.assertEqual(len(base.model.diffusion_model.last._forward_pre_hooks), 1)
+        self.assertEqual(len(base.model.diffusion_model.last._forward_pre_hooks), 0)
 
     def test_nested_clones_keep_the_outer_history(self):
         base = Patcher()
@@ -357,18 +375,45 @@ class NativeKrea2SpectrumTest(unittest.TestCase):
         linear.weight_function = [lambda weight: weight]
         self.assertTrue(krea2.capture_safe(model.model.diffusion_model, torch.ones(1, 4, 5, 6), {}))
 
-    def test_apply_and_diffusion_wrappers_preserve_actual_calls(self):
+    def test_apply_and_diffusion_wrappers_allow_forecasts_without_registration(self):
         for kind in (WrappersMP.APPLY_MODEL, WrappersMP.DIFFUSION_MODEL):
             with self.subTest(kind=kind):
-                model = accelerated()
+                model = Patcher()
                 calls = []
                 def wrapper(executor, *args, **kwargs):
                     calls.append(True)
                     return executor(*args, **kwargs)
-                run_sample(model, options={"wrappers": {kind: {"test": [wrapper]}}})
-                self.assertEqual(model.model.blocks, 8)
-                if kind == WrappersMP.DIFFUSION_MODEL:
-                    self.assertEqual(len(calls), 8)
+                model.add_wrapper_with_key(kind, "test", wrapper)
+                model = accelerated(model)
+                run_sample(model)
+                self.assertLess(model.model.blocks, 8)
+                self.assertEqual(len(calls), model.model.blocks)
+
+    def test_real_core_compile_keeps_live_capture_and_restores_modules(self):
+        from comfy_api.torch_helpers import set_torch_compile_wrapper
+
+        model = Patcher()
+        original_blocks = tuple(model.model.diffusion_model.blocks)
+        original_last = model.model.diffusion_model.last
+        set_torch_compile_wrapper(
+            model, backend="eager", dynamic=True,
+            keys=["diffusion_model.blocks.0", "diffusion_model.blocks.1", "diffusion_model.last"],
+        )
+        model = accelerated(model)
+        seen = []
+        original_capture = krea2.capture
+        def capture(dit):
+            seen.append(type(dit.last).__name__)
+            return original_capture(dit)
+        with patch.object(krea2, "capture", side_effect=capture):
+            result = run_sample(model)
+        self.assertLess(model.model.blocks, 8)
+        self.assertTrue(seen and all(name == "OptimizedModule" for name in seen))
+        self.assertTrue(all(torch.isfinite(value).all() for value in result))
+        self.assertTrue(all(actual is original for actual, original in
+                            zip(model.model.diffusion_model.blocks, original_blocks)))
+        self.assertIs(model.model.diffusion_model.last, original_last)
+        self.assertFalse(original_last._forward_pre_hooks)
 
     def test_control_condition_uses_actual(self):
         model = accelerated()
