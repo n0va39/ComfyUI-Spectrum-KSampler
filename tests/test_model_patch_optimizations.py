@@ -10,7 +10,8 @@ from test_native_moss_spectrum import (
 
 def feature_wrapper(executor, *args, **kwargs):
     """Same lifecycle as DAVE: bind a live block, modify features, then unhook."""
-    block = executor.class_obj.diffusion_model.layers[-1]
+    dit = getattr(executor.class_obj, "diffusion_model", executor.class_obj)
+    block = dit.layers[-1]
     handle = block.register_forward_hook(lambda module, values, output: output + 0.25)
     try:
         return executor(*args, **kwargs)
@@ -50,6 +51,42 @@ class ModelPatchOptimizationsTest(unittest.TestCase):
             self.assertEqual(len(model.model.diffusion_model.layers[-1]._forward_hooks), 0)
         run_sample(model, body=body)
         self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
+
+    def test_diffusion_modifier_before_or_after_spectrum_observes_final_features(self):
+        for before_spectrum in (True, False):
+            with self.subTest(before_spectrum=before_spectrum):
+                model = Patcher()
+                if not before_spectrum:
+                    model = accelerated(model)
+                model.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL,
+                                           "feature-modifier", feature_wrapper)
+                if before_spectrum:
+                    model = accelerated(model)
+                block = model.model.diffusion_model.layers[-1]
+                result = run_sample(model)
+                self.assertEqual(model.model.calls, 5)
+                self.assertEqual(len(result), 12)
+                self.assertFalse(block._forward_hooks)
+
+                def body():
+                    output = run_step(model, 1.0)
+                    feature = state_of(model).forecasters[0].h[-1]
+                    x, t = torch.ones(1, 8, 2, 3), torch.tensor([1.0])
+                    rebuilt = model_patch_moss.head(
+                        model.model.diffusion_model,
+                        model.model.model_sampling.timestep(t).float(), feature, x,
+                    )
+                    rebuilt = model.model.model_sampling.calculate_denoised(t, rebuilt.float(), x)
+                    torch.testing.assert_close(output, rebuilt, rtol=0, atol=0)
+                    with patch.object(block, "forward", side_effect=RuntimeError("injected block failure")):
+                        with self.assertRaisesRegex(RuntimeError, "injected block failure"):
+                            run_step(model, 0.9)
+                    self.assertFalse(block._forward_hooks)
+                    self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
+                    self.assertFalse(state_of(model).forecasters)
+
+                run_sample(model, body=body)
+                self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
 
     def test_existing_explicit_cache_veto_is_preserved_on_downstream_clone(self):
         model = Patcher()
