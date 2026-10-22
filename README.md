@@ -173,6 +173,44 @@ Integration contract:
   `native_spectrum.apply_native_spectrum_patch` and
   `moss.apply_native_moss_spectrum_patch` imports remain compatibility aliases.
 
+### MODEL patch for ComfyUI's built-in Krea2 loader (experimental)
+
+**Spectrum Model Patch (Krea2)** uses the same forecasting and per-sampler
+state management as the MOSS MODEL patch. Only model identification, feature
+capture and output-head reconstruction are Krea2-specific:
+
+```text
+ComfyUI Krea2 MODEL -> Spectrum Model Patch (Krea2) -> KSampler / Custom Sampler
+```
+
+This is experimental forecast acceleration, initially exercised with the INT8
+Turbo checkpoint and its unquantized output head. The adapter accepts ComfyUI's
+Krea2 architecture without detecting checkpoint names or restricting it to
+Turbo. Defaults are **Turbo starting values**: eight steps, degree 1, three
+warmup steps, two final actual steps and eight history entries.
+
+For **RAW**, supply the sampler steps, CFG and flow shift appropriate to that
+checkpoint. The patch follows the actual sigma schedule, including a 52-step
+RAW-style schedule, and keeps conditional/unconditional forecasts separate.
+The `steps` compatibility input does not override the downstream schedule.
+RAW-style schedule and branch behavior are covered by CPU tests; actual RAW
+checkpoint image quality has not been validated. Short Turbo schedules can
+leave little or no room for acceleration. Compare with `enabled=false` for your
+prompts and resolutions. The patch does not add trained Mod Guidance, SPD or
+compilation.
+
+Reference-image conditioning, multiple temporal frames, post-input token patches
+and activation-quantized output heads use full computation. The common runner
+also preserves the MOSS patch's ControlNet, scheduled-hook and wrapper fallback
+rules. Each Highres pass, Detailer cycle and USDU tile gets fresh forecast state.
+
+The public node ID is `SpectrumKrea2ModelPatch`; `NativeKrea2SpectrumPatch`
+remains a deprecated compatibility alias for earlier workflows. Python callers
+can use `model_patch_krea2.apply_krea2_model_patch`; the earlier
+`krea2.apply_krea2_spectrum_patch` import remains an alias. The Krea2 architecture
+is imported only when used, so the original nodes remain loadable on ComfyUI
+versions without Krea2 support.
+
 ### Standalone correction patchers
 
 The extra correction features are also available as standalone `MODEL -> MODEL` patches. These patchers are tuned for Anima-style flow-matching DiTs. They may run on other DiT models that expose compatible ComfyUI sampler semantics, but quality and stability are not guaranteed there.
