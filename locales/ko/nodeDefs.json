@@ -539,7 +539,7 @@
       }
     }
   },
-  "NativeMossSpectrumPatch": {
+  "SpectrumMossModelPatch": {
     "display_name": "Spectrum Model Patch (MOSS)",
     "description": "ComfyUI 기본 로더로 불러온 MOSS의 특징 예측 가속입니다. sampler·CFG·shift를 유지하고 각 샘플링 호출마다 캐시를 초기화합니다. 학습 가이던스·SPD·compile은 추가하지 않습니다.",
     "inputs": {

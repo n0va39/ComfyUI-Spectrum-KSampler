@@ -539,7 +539,7 @@
       }
     }
   },
-  "NativeMossSpectrumPatch": {
+  "SpectrumMossModelPatch": {
     "display_name": "Spectrum Model Patch (MOSS)",
     "description": "ComfyUI 標準ローダーで読み込んだ MOSS の特徴予測による高速化。sampler・CFG・shift を維持し、サンプリング呼び出しごとにキャッシュを初期化します。学習済みガイダンス・SPD・compile は追加しません。",
     "inputs": {

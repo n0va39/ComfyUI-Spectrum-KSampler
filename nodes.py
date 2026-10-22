@@ -18,7 +18,8 @@ from .mod_guidance_layouts import (
     SCHEDULE_BASIS_NATIVE,
 )
 from .smc_cfg import install_smc_cfg
-from .moss import MossSpectrumKSampler, apply_native_moss_spectrum_patch
+from .moss import MossSpectrumKSampler
+from .model_patch_moss import apply_moss_model_patch
 from .spectrum import COMPAT_POLICIES, apply_dit_spectrum_patch, spectrum_sample
 
 logger = logging.getLogger(__name__)
@@ -1769,7 +1770,7 @@ class DiTSpectrumPatchAdvanced(DiTSpectrumPatch):
         return (patched,)
 
 
-class NativeMossSpectrumPatch(DiTSpectrumPatchAdvanced):
+class SpectrumMossModelPatch(DiTSpectrumPatchAdvanced):
     """Forecast-only adapter for ComfyUI's native MOSS-Image implementation."""
 
     SPECTRUM_CAPABILITIES = {
@@ -1824,13 +1825,19 @@ class NativeMossSpectrumPatch(DiTSpectrumPatchAdvanced):
         verbose=False,
         compat_policy="conservative",
     ):
-        return (apply_native_moss_spectrum_patch(
+        return (apply_moss_model_patch(
             model, steps=steps, window_size=window_size, flex_window=flex_window,
             warmup_steps=warmup_steps, tail_actual_steps=tail_actual_steps,
             blend_w=blend_w, cheby_degree=cheby_degree, ridge_lambda=ridge_lambda,
             history_size=history_size, enabled=enabled,
             one_sampler_only=one_sampler_only, verbose=verbose, compat_policy=compat_policy,
         ),)
+
+
+class NativeMossSpectrumPatch(SpectrumMossModelPatch):
+    """Deprecated node ID retained for workflows created before the public rename."""
+
+    DEPRECATED = True
 
 
 class SpectrumSPDKSampler:
@@ -2037,6 +2044,7 @@ NODE_CLASS_MAPPINGS = {
     "DiTSpectrumPatch": DiTSpectrumPatch,
     "DiTSpectrumPatchAdvanced": DiTSpectrumPatchAdvanced,
     "MossSpectrumKSampler": MossSpectrumKSampler,
+    "SpectrumMossModelPatch": SpectrumMossModelPatch,
     "NativeMossSpectrumPatch": NativeMossSpectrumPatch,
     # Deprecated aliases — the mod-guidance + SEA samplers are now folded into
     # the unified SpectrumKSampler (mod_w_profile + refresh_ratio dials). These
@@ -2057,5 +2065,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DiTSpectrumPatch": "DiT Spectrum Patch",
     "DiTSpectrumPatchAdvanced": "DiT Spectrum Patch Advanced",
     "MossSpectrumKSampler": "KSampler (Spectrum for MOSS)",
-    "NativeMossSpectrumPatch": "Spectrum Model Patch (MOSS)",
+    "SpectrumMossModelPatch": "Spectrum Model Patch (MOSS)",
 }

@@ -539,7 +539,7 @@
       }
     }
   },
-  "NativeMossSpectrumPatch": {
+  "SpectrumMossModelPatch": {
     "display_name": "Spectrum Model Patch (MOSS)",
     "description": "为 ComfyUI 内置加载器加载的 MOSS 提供特征预测加速。保留 sampler、CFG 和 shift，每次采样调用均重建缓存。不添加训练引导、SPD 或 compile。",
     "inputs": {

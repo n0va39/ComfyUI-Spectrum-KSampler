@@ -128,8 +128,10 @@ For MOSS-Image loaded by **ComfyUI's built-in loader**, use
 ComfyUI MOSS MODEL -> Spectrum Model Patch (MOSS) -> KSampler / Custom Sampler
 ```
 
-Here, "native" in the internal node ID `NativeMossSpectrumPatch` refers to
-ComfyUI's own MOSS implementation; Spectrum is supplied by this extension.
+The public node ID is `SpectrumMossModelPatch`. The earlier
+`NativeMossSpectrumPatch` ID remains as a deprecated compatibility alias for
+saved workflows. Here, "native" means ComfyUI's own MOSS implementation;
+Spectrum is supplied by this extension.
 The original `KSampler (Spectrum for MOSS)` above still uses its existing
 custom-loader path. Choose the node that matches your loader.
 
@@ -157,6 +159,19 @@ model-specific module owns identification, feature capture and output-head
 reconstruction. Architecture imports are lazy so an older ComfyUI can still
 load the original nodes. Using this patch requires a ComfyUI build that
 includes its own MOSS-Image implementation.
+
+Integration contract:
+
+- Discover `SpectrumMossModelPatch` through `NODE_CLASS_MAPPINGS`, verify its
+  versioned `SPECTRUM_CAPABILITIES`, and call `patch()` with the declared inputs.
+  Model, loader, feature and stage support are explicit; the display name is
+  not a discovery API. Older installations may expose `NativeMossSpectrumPatch`.
+- Python callers use `model_patch_moss.apply_moss_model_patch`. Future model
+  adapters use `model_patch.apply_spectrum_model_patch` for the shared lifecycle.
+  `feature_forecast.py` owns the existing token prediction math.
+- The former `native_moss.apply_native_moss_spectrum_patch`,
+  `native_spectrum.apply_native_spectrum_patch` and
+  `moss.apply_native_moss_spectrum_patch` imports remain compatibility aliases.
 
 ### Standalone correction patchers
 

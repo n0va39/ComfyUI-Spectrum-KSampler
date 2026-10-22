@@ -32,8 +32,8 @@ package = types.ModuleType(PACKAGE)
 package.__path__ = [str(ROOT)]
 sys.modules[PACKAGE] = package
 moss = importlib.import_module(f"{PACKAGE}.moss")
-native_moss = importlib.import_module(f"{PACKAGE}.native_moss")
-native_spectrum = importlib.import_module(f"{PACKAGE}.native_spectrum")
+model_patch_moss = importlib.import_module(f"{PACKAGE}.model_patch_moss")
+model_patch = importlib.import_module(f"{PACKAGE}.model_patch")
 spectrum = importlib.import_module(f"{PACKAGE}.spectrum")
 node_module = importlib.import_module(f"{PACKAGE}.nodes")
 
@@ -110,7 +110,7 @@ def run_sample(model, sigmas=SIGMAS, body=None, **step_options):
 
 
 def accelerated(model=None, **kwargs):
-    return moss.apply_native_moss_spectrum_patch(
+    return model_patch_moss.apply_moss_model_patch(
         Patcher() if model is None else model,
         steps=12, warmup_steps=3, tail_actual_steps=2, cheby_degree=1,
         history_size=8, window_size=10, flex_window=0, **kwargs,
@@ -135,6 +135,21 @@ def run_step(model, sigma, *, branch=0, height=2, width=3, options=None, base=No
 
 
 class NativeMossSpectrumTest(unittest.TestCase):
+    def test_legacy_node_and_python_imports_resolve_to_the_canonical_patch(self):
+        canonical = node_module.SpectrumMossModelPatch
+        legacy = node_module.NODE_CLASS_MAPPINGS["NativeMossSpectrumPatch"]
+        self.assertIs(legacy, node_module.NativeMossSpectrumPatch)
+        self.assertTrue(legacy.DEPRECATED)
+        self.assertIs(legacy.patch, canonical.patch)
+        self.assertEqual(legacy.INPUT_TYPES(), canonical.INPUT_TYPES())
+        self.assertEqual(legacy.RETURN_TYPES, canonical.RETURN_TYPES)
+        old_moss = importlib.import_module(f"{PACKAGE}.native_moss")
+        old_runner = importlib.import_module(f"{PACKAGE}.native_spectrum")
+        self.assertIs(old_moss.apply_native_moss_spectrum_patch, model_patch_moss.apply_moss_model_patch)
+        self.assertIs(moss.apply_native_moss_spectrum_patch, model_patch_moss.apply_moss_model_patch)
+        self.assertIs(old_runner.apply_native_spectrum_patch, model_patch.apply_spectrum_model_patch)
+        self.assertIs(old_runner.record_feature, model_patch.record_feature)
+
     def test_native_head_matches_actual_forward_for_batches_and_dtypes(self):
         for dtype in (torch.float32, torch.bfloat16):
             for batch in (1, 2):
@@ -153,17 +168,17 @@ class NativeMossSpectrumTest(unittest.TestCase):
                         expected = dit(x, time, context)
                     finally:
                         handle.remove()
-                    actual = native_moss.head(dit, time, features[0], x)
+                    actual = model_patch_moss.head(dit, time, features[0], x)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_public_contract_and_disabled_identity(self):
-        cls = node_module.NativeMossSpectrumPatch
+        cls = node_module.SpectrumMossModelPatch
         expected = {
             "contract_version": 1, "model_family": "moss_image",
             "loader": "comfy_native", "features": ["forecast"],
             "stages": ["sampler", "highres", "detailer", "upscale"],
         }
-        self.assertIs(node_module.NODE_CLASS_MAPPINGS["NativeMossSpectrumPatch"], cls)
+        self.assertIs(node_module.NODE_CLASS_MAPPINGS["SpectrumMossModelPatch"], cls)
         self.assertEqual(cls.SPECTRUM_CAPABILITIES, expected)
         self.assertEqual(cls.INPUT_TYPES()["required"]["model"][1]["spectrum_capabilities"], expected)
         self.assertEqual(
@@ -197,7 +212,7 @@ class NativeMossSpectrumTest(unittest.TestCase):
                 self.assertEqual(result.shape, (1, 8, 2, 3))
                 self.assertTrue(torch.isfinite(result).all())
             self.assertEqual(model.model.calls, count)
-            self.assertIsNone(native_spectrum._NATIVE_CAPTURE.get())
+            self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
         run_sample(model, body=body)
         self.assertIsNone(state_of(model))
         self.assertEqual(states[0].forecasters, {})
@@ -263,7 +278,7 @@ class NativeMossSpectrumTest(unittest.TestCase):
         self.assertIsNone(state_of(model))
         self.assertEqual(states[0].forecasters, {})
         self.assertIsNone(states[0].features)
-        self.assertIsNone(native_spectrum._NATIVE_CAPTURE.get())
+        self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
         model.model.fail = False
         with torch.inference_mode():
             actual_base = model.model.apply_model(*args)
@@ -302,7 +317,7 @@ class NativeMossSpectrumTest(unittest.TestCase):
         self.assertEqual(len(block._forward_hooks), 1)
         self.assertFalse(hasattr(block, "_native_spectrum_state"))
         self.assertIsNone(state_of(first))
-        self.assertIsNone(native_spectrum._NATIVE_CAPTURE.get())
+        self.assertIsNone(model_patch._NATIVE_CAPTURE.get())
 
     def test_unsafe_wrapper_preserves_calls_and_last_block_replacement_falls_back(self):
         calls = []
