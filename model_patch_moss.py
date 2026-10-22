@@ -27,11 +27,12 @@ def _capture_hook(module, args, output):
 
 def capture_owner(dit):
     # Native RMSNorm is fused: final_norm_video.forward itself is not called.
-    block = dit.layers[-1]
-    if not getattr(block, "_native_spectrum_hook_installed", False):
-        block.register_forward_hook(_capture_hook)
-        block._native_spectrum_hook_installed = True
-    return block
+    return dit.layers[-1]
+
+
+def capture(dit):
+    owner = capture_owner(dit)
+    return owner, owner.register_forward_hook(_capture_hook)
 
 
 def extract_features(tensor, input_x, c):

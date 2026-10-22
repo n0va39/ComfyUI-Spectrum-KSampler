@@ -146,12 +146,24 @@ nonempty sampling invocation in a workflow execution. Warmup and final-tail
 steps always compute the model, and a short schedule may do no forecasting.
 
 The adapter falls back to full computation for ControlNet inputs, active
-scheduled weight hooks, APPLY_MODEL/DIFFUSION_MODEL wrappers and replacement of
-the last transformer block. Unknown model-function wrappers also fall back
+scheduled weight hooks and replacement of the last transformer block.
+APPLY_MODEL/DIFFUSION_MODEL wrappers do not themselves disable forecasting;
+block compilation and feature-modifying hooks can compose through the existing
+Spectrum cache policy without registration or an approval list.
+Unknown model-function wrappers still fall back
 under the default conservative policy. Direct forwards outside a sampler scope
 compute normally. Fixed LoRA weights still pass through the model's own head
 modules; this does not establish compatibility with every external patch
 combination. Compare against `enabled=false` for your prompts and resolutions.
+
+Capture resolves the live block inside the diffusion-model wrapper boundary,
+after compile swaps and upstream feature hooks have entered. Its temporary
+hook is removed in `finally`, including failed forwards. This differs from the
+custom-loader MOSS capture site because ComfyUI's built-in MOSS fuses its final
+normalization. Forecast math, warmup/tail rules, explicit cache vetoes and the
+existing model-function-wrapper policy are shared with the original Spectrum
+implementation. Verbose logs report actual and forecast call counts; an enabled
+patch is not a claim that a particular short schedule skipped any calls.
 
 The adapter reuses the existing MOSS token forecaster and Spectrum cache/branch
 policy. Shared code owns forecasting and sampling-state lifetime, while the
