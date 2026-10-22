@@ -137,21 +137,26 @@ def apply_spectrum_model_patch(
 
 
 def _install_capture_scope(model, adapter):
-    from comfy.patcher_extension import WrappersMP, add_wrapper_with_key
+    from comfy.patcher_extension import WrapperExecutor, WrappersMP, add_wrapper_with_key
 
     def capture_wrapper(executor, *args, **kwargs):
         capture = _NATIVE_CAPTURE.get()
         if capture is None:
             return executor(*args, **kwargs)
-        # APPLY_MODEL optimizations have now swapped their live modules and
-        # installed hooks. Observe after them, then remove our hook on every exit.
-        owner, handle = adapter.capture(executor.class_obj)
-        token = _NATIVE_CAPTURE.set((owner, capture[1], capture[2]))
-        try:
-            return executor(*args, **kwargs)
-        finally:
-            handle.remove()
-            _NATIVE_CAPTURE.reset(token)
+        def capture_forward(*forward_args, **forward_kwargs):
+            # All optimization wrappers have now installed their hooks and live
+            # modules. Observe their final features regardless of wrapper order.
+            owner, handle = adapter.capture(executor.class_obj)
+            token = _NATIVE_CAPTURE.set((owner, capture[1], capture[2]))
+            try:
+                return executor.original(*forward_args, **forward_kwargs)
+            finally:
+                handle.remove()
+                _NATIVE_CAPTURE.reset(token)
+
+        return WrapperExecutor.new_class_executor(
+            capture_forward, executor.class_obj, executor.wrappers, executor.idx,
+        )(*args, **kwargs)
 
     options = model.model_options.setdefault("transformer_options", {})
     add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, adapter.key + "_capture",
